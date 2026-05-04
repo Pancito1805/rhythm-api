@@ -4,7 +4,7 @@ const fs = require('fs');
 const path = require('path');
 
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 
 app.use(cors());
 app.use(express.json());
@@ -15,9 +15,11 @@ if (!fs.existsSync(SCORES_FILE)) {
     fs.writeFileSync(SCORES_FILE, JSON.stringify([]));
 }
 
-// Guardar puntaje
+// ===== GUARDAR PUNTAJE =====
 app.post('/api/scores', (req, res) => {
     const { name, score, song, combo, player } = req.body;
+    
+    console.log("Recibido:", { name, score, song, combo, player });
     
     if (!name || !score || !song) {
         return res.status(400).json({ error: 'Faltan datos' });
@@ -31,7 +33,8 @@ app.post('/api/scores', (req, res) => {
         score: parseInt(score),
         song: song,
         combo: combo || 0,
-        player: player || 1,  
+        player: player || 1,
+        date: new Date().toISOString()
     };
     
     scores.push(newEntry);
@@ -40,9 +43,11 @@ app.post('/api/scores', (req, res) => {
     const topScores = scores.slice(0, 100);
     fs.writeFileSync(SCORES_FILE, JSON.stringify(topScores, null, 2));
     
+    console.log("✅ Puntaje guardado:", newEntry.name, newEntry.score);
     res.json({ success: true, id: newEntry.id });
 });
-// Obtener leaderboard por canción
+
+// ===== OBTENER LEADERBOARD POR CANCIÓN =====
 app.get('/api/leaderboard/:song', (req, res) => {
     const song = req.params.song;
     const scores = JSON.parse(fs.readFileSync(SCORES_FILE));
@@ -50,10 +55,23 @@ app.get('/api/leaderboard/:song', (req, res) => {
     res.json(filtered.slice(0, 20));
 });
 
-// Obtener top global
+// ===== OBTENER TOP GLOBAL =====
 app.get('/api/global', (req, res) => {
     const scores = JSON.parse(fs.readFileSync(SCORES_FILE));
     res.json(scores.slice(0, 20));
+});
+
+// ===== OBTENER TODOS LOS PUNTAJES (para debug) =====
+app.get('/api/all', (req, res) => {
+    const scores = JSON.parse(fs.readFileSync(SCORES_FILE));
+    res.json(scores);
+});
+
+// ===== LIMPIAR TODOS LOS PUNTAJES (para debug) =====
+app.delete('/api/clear', (req, res) => {
+    fs.writeFileSync(SCORES_FILE, JSON.stringify([]));
+    console.log("🗑️ Todos los puntajes eliminados");
+    res.json({ success: true });
 });
 
 app.listen(PORT, () => {
