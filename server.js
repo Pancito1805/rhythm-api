@@ -77,3 +77,25 @@ app.delete('/api/clear', (req, res) => {
 app.listen(PORT, () => {
     console.log(`🎵 API corriendo en http://localhost:${PORT}`);
 });
+
+// Eliminar TODOS los puntajes
+app.delete('/api/clear', (req, res) => {
+    fs.writeFileSync(SCORES_FILE, JSON.stringify([]));
+    console.log("🗑️ Todos los puntajes eliminados");
+    res.json({ success: true, message: "Todos los puntajes fueron eliminados" });
+});
+
+// Eliminar un puntaje específico por ID
+app.delete('/api/scores/:id', (req, res) => {
+    const id = parseInt(req.params.id);
+    const scores = JSON.parse(fs.readFileSync(SCORES_FILE));
+    const filtered = scores.filter(s => s.id !== id);
+    
+    if (filtered.length === scores.length) {
+        return res.status(404).json({ error: "Puntaje no encontrado" });
+    }
+    
+    fs.writeFileSync(SCORES_FILE, JSON.stringify(filtered, null, 2));
+    console.log(`🗑️ Puntaje ${id} eliminado`);
+    res.json({ success: true, message: "Puntaje eliminado" });
+});
