@@ -54,7 +54,6 @@ app.post('/api/register', (req, res) => {
         return res.status(400).json({ error: 'El usuario ya existe' });
     }
     
-    // Hash simple (en producción usar bcrypt)
     const simpleHash = Buffer.from(password).toString('base64');
     
     db.users[username] = {
@@ -103,7 +102,6 @@ app.post('/api/save_game', (req, res) => {
         return res.status(404).json({ error: 'Usuario no encontrado' });
     }
     
-    // Guardar en historial del usuario
     const gameEntry = { 
         score: parseInt(score), 
         song: song, 
@@ -113,7 +111,6 @@ app.post('/api/save_game', (req, res) => {
     };
     db.users[username].games.push(gameEntry);
     
-    // Actualizar leaderboard global (solo mejores puntajes)
     const leaderboardEntry = { 
         name: username, 
         score: parseInt(score), 
@@ -123,7 +120,6 @@ app.post('/api/save_game', (req, res) => {
     };
     db.global_leaderboard.push(leaderboardEntry);
     
-    // Ordenar y mantener top 100
     db.global_leaderboard.sort((a, b) => b.score - a.score);
     db.global_leaderboard = db.global_leaderboard.slice(0, 100);
     
@@ -143,7 +139,6 @@ app.get('/api/user_games/:username', (req, res) => {
         return res.status(404).json({ error: 'Usuario no encontrado' });
     }
     
-    // Ordenar partidas por puntaje (mayor a menor)
     const games = db.users[username].games;
     games.sort((a, b) => b.score - a.score);
     
@@ -157,7 +152,7 @@ app.get('/api/global_leaderboard', (req, res) => {
     res.json(db.global_leaderboard.slice(0, 50));
 });
 
-// ===== 6. OBTENER TOP JUGADORES (por sumatoria de puntos) =====
+// ===== 6. OBTENER TOP JUGADORES =====
 app.get('/api/top_players', (req, res) => {
     console.log("👑 Solicitando top jugadores");
     const db = readDB();
@@ -185,19 +180,86 @@ app.get('/api/top_players', (req, res) => {
     res.json(playersStats.slice(0, 20));
 });
 
-// ===== 7. NUEVO ENDPOINT PARA COMPATIBILIDAD (mantener viejo) =====
+// ===== 7. ENDPOINT PARA VER TODOS LOS USUARIOS =====
+app.get('/api/users', (req, res) => {
+    console.log("📋 Solicitando lista de usuarios");
+    const db = readDB();
+    
+    const usersList = Object.keys(db.users).map(username => ({
+        username: username,
+        games_played: db.users[username].games.length,
+        created_at: db.users[username].created_at
+    }));
+    
+    res.json(usersList);
+});
+
+// ===== 8. ENDPOINT PARA VER DETALLES DE UN USUARIO =====
+app.get('/api/user/:username', (req, res) => {
+    const { username } = req.params;
+    console.log("🔍 Solicitando detalles de usuario:", username);
+    
+    const db = readDB();
+    
+    if (!db.users[username]) {
+        return res.status(404).json({ error: 'Usuario no encontrado' });
+    }
+    
+    res.json({
+        username: username,
+        games: db.users[username].games,
+        total_games: db.users[username].games.length,
+        created_at: db.users[username].created_at
+    });
+});
+
+// ===== 9. ENDPOINT PARA ELIMINAR UN USUARIO =====
+app.delete('/api/user/:username', (req, res) => {
+    const { username } = req.params;
+    console.log("🗑️ Eliminando usuario:", username);
+    
+    const db = readDB();
+    
+    if (!db.users[username]) {
+        return res.status(404).json({ error: 'Usuario no encontrado' });
+    }
+    
+    // Eliminar sus partidas del leaderboard global
+    db.global_leaderboard = db.global_leaderboard.filter(entry => entry.name !== username);
+    
+    // Eliminar usuario
+    delete db.users[username];
+    
+    saveDB(db);
+    console.log("✅ Usuario", username, "eliminado");
+    res.json({ success: true, message: `Usuario ${username} eliminado` });
+});
+
+// ===== 10. ENDPOINT PARA ELIMINAR TODOS LOS DATOS =====
+app.delete('/api/clear-all', (req, res) => {
+    console.log("🗑️ ELIMINANDO TODOS LOS DATOS");
+    
+    const emptyDB = {
+        users: {},
+        global_leaderboard: []
+    };
+    saveDB(emptyDB);
+    
+    console.log("✅ Base de datos completamente limpiada");
+    res.json({ success: true, message: "Todos los datos eliminados" });
+});
+
+// ===== 11. ENDPOINT ANTIGUO PARA COMPATIBILIDAD =====
 app.post('/api/scores', (req, res) => {
     const { name, score, song, combo, player } = req.body;
     console.log("⚠️ Endpoint antiguo usado - redirigiendo a save_game");
     
-    // Redirigir al nuevo sistema
     const username = name;
     const date = new Date().toISOString();
     
     const db = readDB();
     
     if (!db.users[username]) {
-        // Si no existe, crear usuario temporal
         db.users[username] = {
             password: Buffer.from("temporal").toString('base64'),
             games: [],
@@ -217,14 +279,14 @@ app.post('/api/scores', (req, res) => {
     res.json({ success: true });
 });
 
-// ===== 8. NUEVO ENDPOINT PARA COMPATIBILIDAD (leaderboard) =====
+// ===== 12. ENDPOINT ANTIGUO /global =====
 app.get('/api/global', (req, res) => {
     console.log("⚠️ Endpoint antiguo /global usado");
     const db = readDB();
     res.json(db.global_leaderboard.slice(0, 20));
 });
 
-// ===== 9. LIMPIAR BASE DE DATOS (solo desarrollo) =====
+// ===== 13. LIMPIAR BASE DE DATOS (endpoint original) =====
 app.delete('/api/clear', (req, res) => {
     const emptyDB = {
         users: {},
@@ -244,4 +306,8 @@ app.listen(PORT, () => {
     console.log(`   POST /api/save_game - Guardar partida`);
     console.log(`   GET /api/user_games/:username - Historial del usuario`);
     console.log(`   GET /api/global_leaderboard - Leaderboard global`);
+    console.log(`   GET /api/users - VER TODOS los usuarios`);
+    console.log(`   GET /api/user/:username - Ver detalles de usuario`);
+    console.log(`   DELETE /api/user/:username - Eliminar usuario`);
+    console.log(`   DELETE /api/clear-all - ELIMINAR TODOS los datos`);
 });
