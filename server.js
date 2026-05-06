@@ -9,93 +9,239 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-const SCORES_FILE = path.join(__dirname, 'scores.json');
+const DB_FILE = path.join(__dirname, 'scores.json');
 
-if (!fs.existsSync(SCORES_FILE)) {
-    fs.writeFileSync(SCORES_FILE, JSON.stringify([]));
+// ===== INICIALIZAR BASE DE DATOS =====
+if (!fs.existsSync(DB_FILE)) {
+    const initialDB = {
+        users: {},
+        global_leaderboard: []
+    };
+    fs.writeFileSync(DB_FILE, JSON.stringify(initialDB, null, 2));
 }
 
-// ===== GUARDAR PUNTAJE =====
-app.post('/api/scores', (req, res) => {
-    const { name, score, song, combo, player } = req.body;
+// ===== FUNCIÓN PARA LEER BASE DE DATOS =====
+function readDB() {
+    return JSON.parse(fs.readFileSync(DB_FILE));
+}
+
+// ===== FUNCIÓN PARA GUARDAR BASE DE DATOS =====
+function saveDB(db) {
+    fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
+}
+
+// ===== 1. REGISTRO DE USUARIO =====
+app.post('/api/register', (req, res) => {
+    const { username, password } = req.body;
     
-    console.log("Recibido:", { name, score, song, combo, player });
+    console.log("📝 Intento de registro:", username);
     
-    if (!name || !score || !song) {
+    if (!username || !password) {
         return res.status(400).json({ error: 'Faltan datos' });
     }
     
-    const scores = JSON.parse(fs.readFileSync(SCORES_FILE));
+    if (username.length < 3) {
+        return res.status(400).json({ error: 'El usuario debe tener al menos 3 caracteres' });
+    }
     
-    const newEntry = {
-        id: Date.now(),
-        name: name.substring(0, 5).toUpperCase(),
-        score: parseInt(score),
-        song: song,
-        combo: combo || 0,
-        player: player || 1,
-        date: new Date().toISOString()
+    if (password.length < 3) {
+        return res.status(400).json({ error: 'La contraseña debe tener al menos 3 caracteres' });
+    }
+    
+    const db = readDB();
+    
+    if (db.users[username]) {
+        return res.status(400).json({ error: 'El usuario ya existe' });
+    }
+    
+    // Hash simple (en producción usar bcrypt)
+    const simpleHash = Buffer.from(password).toString('base64');
+    
+    db.users[username] = {
+        password: simpleHash,
+        games: [],
+        created_at: new Date().toISOString()
     };
     
-    scores.push(newEntry);
-    scores.sort((a, b) => b.score - a.score);
+    saveDB(db);
+    console.log("✅ Usuario registrado:", username);
+    res.json({ success: true, message: 'Usuario creado exitosamente' });
+});
+
+// ===== 2. LOGIN DE USUARIO =====
+app.post('/api/login', (req, res) => {
+    const { username, password } = req.body;
     
-    const topScores = scores.slice(0, 100);
-    fs.writeFileSync(SCORES_FILE, JSON.stringify(topScores, null, 2));
+    console.log("🔐 Intento de login:", username);
     
-    console.log("✅ Puntaje guardado:", newEntry.name, newEntry.score);
-    res.json({ success: true, id: newEntry.id });
+    const db = readDB();
+    const user = db.users[username];
+    
+    if (!user) {
+        return res.status(401).json({ error: 'Usuario no existe' });
+    }
+    
+    const hash = Buffer.from(password).toString('base64');
+    
+    if (user.password !== hash) {
+        return res.status(401).json({ error: 'Contraseña incorrecta' });
+    }
+    
+    console.log("✅ Login exitoso:", username);
+    res.json({ success: true, username: username });
 });
 
-// ===== OBTENER LEADERBOARD POR CANCIÓN =====
-app.get('/api/leaderboard/:song', (req, res) => {
-    const song = req.params.song;
-    const scores = JSON.parse(fs.readFileSync(SCORES_FILE));
-    const filtered = scores.filter(s => s.song === song);
-    res.json(filtered.slice(0, 20));
-});
-
-// ===== OBTENER TOP GLOBAL =====
-app.get('/api/global', (req, res) => {
-    const scores = JSON.parse(fs.readFileSync(SCORES_FILE));
-    res.json(scores.slice(0, 20));
-});
-
-// ===== OBTENER TODOS LOS PUNTAJES (para debug) =====
-app.get('/api/all', (req, res) => {
-    const scores = JSON.parse(fs.readFileSync(SCORES_FILE));
-    res.json(scores);
-});
-
-// ===== LIMPIAR TODOS LOS PUNTAJES (para debug) =====
-app.delete('/api/clear', (req, res) => {
-    fs.writeFileSync(SCORES_FILE, JSON.stringify([]));
-    console.log("🗑️ Todos los puntajes eliminados");
+// ===== 3. GUARDAR PARTIDA =====
+app.post('/api/save_game', (req, res) => {
+    const { username, score, song, combo, player, date } = req.body;
+    
+    console.log("💾 Guardando partida de:", username, "- Puntaje:", score);
+    
+    const db = readDB();
+    
+    if (!db.users[username]) {
+        return res.status(404).json({ error: 'Usuario no encontrado' });
+    }
+    
+    // Guardar en historial del usuario
+    const gameEntry = { 
+        score: parseInt(score), 
+        song: song, 
+        combo: combo || 0, 
+        player: player || 1, 
+        date: date || new Date().toISOString() 
+    };
+    db.users[username].games.push(gameEntry);
+    
+    // Actualizar leaderboard global (solo mejores puntajes)
+    const leaderboardEntry = { 
+        name: username, 
+        score: parseInt(score), 
+        song: song, 
+        combo: combo || 0, 
+        date: date || new Date().toISOString() 
+    };
+    db.global_leaderboard.push(leaderboardEntry);
+    
+    // Ordenar y mantener top 100
+    db.global_leaderboard.sort((a, b) => b.score - a.score);
+    db.global_leaderboard = db.global_leaderboard.slice(0, 100);
+    
+    saveDB(db);
+    console.log("✅ Partida guardada correctamente");
     res.json({ success: true });
 });
 
-app.listen(PORT, () => {
-    console.log(`🎵 API corriendo en http://localhost:${PORT}`);
-});
-
-// Eliminar TODOS los puntajes
-app.delete('/api/clear', (req, res) => {
-    fs.writeFileSync(SCORES_FILE, JSON.stringify([]));
-    console.log("🗑️ Todos los puntajes eliminados");
-    res.json({ success: true, message: "Todos los puntajes fueron eliminados" });
-});
-
-// Eliminar un puntaje específico por ID
-app.delete('/api/scores/:id', (req, res) => {
-    const id = parseInt(req.params.id);
-    const scores = JSON.parse(fs.readFileSync(SCORES_FILE));
-    const filtered = scores.filter(s => s.id !== id);
+// ===== 4. OBTENER HISTORIAL DEL USUARIO =====
+app.get('/api/user_games/:username', (req, res) => {
+    const { username } = req.params;
+    console.log("📋 Solicitando historial de:", username);
     
-    if (filtered.length === scores.length) {
-        return res.status(404).json({ error: "Puntaje no encontrado" });
+    const db = readDB();
+    
+    if (!db.users[username]) {
+        return res.status(404).json({ error: 'Usuario no encontrado' });
     }
     
-    fs.writeFileSync(SCORES_FILE, JSON.stringify(filtered, null, 2));
-    console.log(`🗑️ Puntaje ${id} eliminado`);
-    res.json({ success: true, message: "Puntaje eliminado" });
+    // Ordenar partidas por puntaje (mayor a menor)
+    const games = db.users[username].games;
+    games.sort((a, b) => b.score - a.score);
+    
+    res.json(games);
+});
+
+// ===== 5. OBTENER LEADERBOARD GLOBAL =====
+app.get('/api/global_leaderboard', (req, res) => {
+    console.log("🏆 Solicitando leaderboard global");
+    const db = readDB();
+    res.json(db.global_leaderboard.slice(0, 50));
+});
+
+// ===== 6. OBTENER TOP JUGADORES (por sumatoria de puntos) =====
+app.get('/api/top_players', (req, res) => {
+    console.log("👑 Solicitando top jugadores");
+    const db = readDB();
+    
+    const playersStats = [];
+    for (const [name, user] of Object.entries(db.users)) {
+        let totalScore = 0;
+        let gamesCount = user.games.length;
+        let bestScore = 0;
+        
+        for (const game of user.games) {
+            totalScore += game.score;
+            if (game.score > bestScore) bestScore = game.score;
+        }
+        
+        playersStats.push({
+            name: name,
+            total_score: totalScore,
+            best_score: bestScore,
+            games_played: gamesCount
+        });
+    }
+    
+    playersStats.sort((a, b) => b.total_score - a.total_score);
+    res.json(playersStats.slice(0, 20));
+});
+
+// ===== 7. NUEVO ENDPOINT PARA COMPATIBILIDAD (mantener viejo) =====
+app.post('/api/scores', (req, res) => {
+    const { name, score, song, combo, player } = req.body;
+    console.log("⚠️ Endpoint antiguo usado - redirigiendo a save_game");
+    
+    // Redirigir al nuevo sistema
+    const username = name;
+    const date = new Date().toISOString();
+    
+    const db = readDB();
+    
+    if (!db.users[username]) {
+        // Si no existe, crear usuario temporal
+        db.users[username] = {
+            password: Buffer.from("temporal").toString('base64'),
+            games: [],
+            created_at: date
+        };
+    }
+    
+    const gameEntry = { score: parseInt(score), song, combo: combo || 0, player: player || 1, date };
+    db.users[username].games.push(gameEntry);
+    
+    const leaderboardEntry = { name: username, score: parseInt(score), song, combo: combo || 0, date };
+    db.global_leaderboard.push(leaderboardEntry);
+    db.global_leaderboard.sort((a, b) => b.score - a.score);
+    db.global_leaderboard = db.global_leaderboard.slice(0, 100);
+    
+    saveDB(db);
+    res.json({ success: true });
+});
+
+// ===== 8. NUEVO ENDPOINT PARA COMPATIBILIDAD (leaderboard) =====
+app.get('/api/global', (req, res) => {
+    console.log("⚠️ Endpoint antiguo /global usado");
+    const db = readDB();
+    res.json(db.global_leaderboard.slice(0, 20));
+});
+
+// ===== 9. LIMPIAR BASE DE DATOS (solo desarrollo) =====
+app.delete('/api/clear', (req, res) => {
+    const emptyDB = {
+        users: {},
+        global_leaderboard: []
+    };
+    saveDB(emptyDB);
+    console.log("🗑️ Base de datos limpiada");
+    res.json({ success: true, message: "Datos eliminados" });
+});
+
+// ===== INICIAR SERVIDOR =====
+app.listen(PORT, () => {
+    console.log(`🎵 API de Rhythm Game corriendo en http://localhost:${PORT}`);
+    console.log(`📋 Endpoints disponibles:`);
+    console.log(`   POST /api/register - Registro de usuario`);
+    console.log(`   POST /api/login - Inicio de sesión`);
+    console.log(`   POST /api/save_game - Guardar partida`);
+    console.log(`   GET /api/user_games/:username - Historial del usuario`);
+    console.log(`   GET /api/global_leaderboard - Leaderboard global`);
 });
