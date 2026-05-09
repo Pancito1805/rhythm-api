@@ -1,7 +1,6 @@
 const express = require('express');
 const cors = require('cors');
-const fs = require('fs');
-const path = require('path');
+const { Pool } = require('pg');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -9,29 +8,53 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-const DB_FILE = path.join(__dirname, 'scores.json');
+// ===== CONEXIÓN A POSTGRESQL =====
+// Render proporciona esta variable automáticamente
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: { rejectUnauthorized: false }  // Necesario para Render
+});
 
-// ===== INICIALIZAR BASE DE DATOS =====
-if (!fs.existsSync(DB_FILE)) {
-    const initialDB = {
-        users: {},
-        global_leaderboard: []
-    };
-    fs.writeFileSync(DB_FILE, JSON.stringify(initialDB, null, 2));
-}
-
-// ===== FUNCIÓN PARA LEER BASE DE DATOS =====
-function readDB() {
-    return JSON.parse(fs.readFileSync(DB_FILE));
-}
-
-// ===== FUNCIÓN PARA GUARDAR BASE DE DATOS =====
-function saveDB(db) {
-    fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
+// ===== CREAR TABLAS SI NO EXISTEN =====
+async function initDB() {
+    const client = await pool.connect();
+    try {
+        // Tabla de usuarios
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS users (
+                username VARCHAR(50) PRIMARY KEY,
+                password_hash VARCHAR(255) NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `);
+        
+        // Tabla de partidas
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS games (
+                id SERIAL PRIMARY KEY,
+                username VARCHAR(50) REFERENCES users(username) ON DELETE CASCADE,
+                score INTEGER NOT NULL,
+                song VARCHAR(100) NOT NULL,
+                combo INTEGER DEFAULT 0,
+                player INTEGER DEFAULT 1,
+                played_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `);
+        
+        // Índices para búsquedas rápidas
+        await client.query(`CREATE INDEX IF NOT EXISTS idx_games_username ON games(username)`);
+        await client.query(`CREATE INDEX IF NOT EXISTS idx_games_score ON games(score)`);
+        
+        console.log("✅ Base de datos inicializada correctamente");
+    } catch (err) {
+        console.error("❌ Error al inicializar DB:", err);
+    } finally {
+        client.release();
+    }
 }
 
 // ===== 1. REGISTRO DE USUARIO =====
-app.post('/api/register', (req, res) => {
+app.post('/api/register', async (req, res) => {
     const { username, password } = req.body;
     
     console.log("📝 Intento de registro:", username);
@@ -48,266 +71,242 @@ app.post('/api/register', (req, res) => {
         return res.status(400).json({ error: 'La contraseña debe tener al menos 3 caracteres' });
     }
     
-    const db = readDB();
-    
-    if (db.users[username]) {
-        return res.status(400).json({ error: 'El usuario ya existe' });
+    try {
+        const simpleHash = Buffer.from(password).toString('base64');
+        
+        await pool.query(
+            'INSERT INTO users (username, password_hash) VALUES ($1, $2)',
+            [username, simpleHash]
+        );
+        
+        console.log("✅ Usuario registrado:", username);
+        res.json({ success: true, message: 'Usuario creado exitosamente' });
+    } catch (err) {
+        if (err.code === '23505') {  // Violación de clave única
+            res.status(400).json({ error: 'El usuario ya existe' });
+        } else {
+            console.error("Error en registro:", err);
+            res.status(500).json({ error: 'Error interno del servidor' });
+        }
     }
-    
-    const simpleHash = Buffer.from(password).toString('base64');
-    
-    db.users[username] = {
-        password: simpleHash,
-        games: [],
-        created_at: new Date().toISOString()
-    };
-    
-    saveDB(db);
-    console.log("✅ Usuario registrado:", username);
-    res.json({ success: true, message: 'Usuario creado exitosamente' });
 });
 
 // ===== 2. LOGIN DE USUARIO =====
-app.post('/api/login', (req, res) => {
+app.post('/api/login', async (req, res) => {
     const { username, password } = req.body;
     
     console.log("🔐 Intento de login:", username);
     
-    const db = readDB();
-    const user = db.users[username];
-    
-    if (!user) {
-        return res.status(401).json({ error: 'Usuario no existe' });
+    try {
+        const result = await pool.query(
+            'SELECT password_hash FROM users WHERE username = $1',
+            [username]
+        );
+        
+        if (result.rows.length === 0) {
+            return res.status(401).json({ error: 'Usuario no existe' });
+        }
+        
+        const hash = Buffer.from(password).toString('base64');
+        
+        if (result.rows[0].password_hash !== hash) {
+            return res.status(401).json({ error: 'Contraseña incorrecta' });
+        }
+        
+        console.log("✅ Login exitoso:", username);
+        res.json({ success: true, username: username });
+    } catch (err) {
+        console.error("Error en login:", err);
+        res.status(500).json({ error: 'Error interno del servidor' });
     }
-    
-    const hash = Buffer.from(password).toString('base64');
-    
-    if (user.password !== hash) {
-        return res.status(401).json({ error: 'Contraseña incorrecta' });
-    }
-    
-    console.log("✅ Login exitoso:", username);
-    res.json({ success: true, username: username });
 });
 
 // ===== 3. GUARDAR PARTIDA =====
-app.post('/api/save_game', (req, res) => {
+app.post('/api/save_game', async (req, res) => {
     const { username, score, song, combo, player, date } = req.body;
     
     console.log("💾 Guardando partida de:", username, "- Puntaje:", score);
     
-    const db = readDB();
-    
-    if (!db.users[username]) {
-        return res.status(404).json({ error: 'Usuario no encontrado' });
+    try {
+        // Verificar que el usuario existe
+        const userCheck = await pool.query('SELECT username FROM users WHERE username = $1', [username]);
+        
+        if (userCheck.rows.length === 0) {
+            return res.status(404).json({ error: 'Usuario no encontrado' });
+        }
+        
+        // Insertar partida
+        await pool.query(
+            'INSERT INTO games (username, score, song, combo, player, played_at) VALUES ($1, $2, $3, $4, $5, COALESCE($6, CURRENT_TIMESTAMP))',
+            [username, parseInt(score), song, combo || 0, player || 1, date || null]
+        );
+        
+        console.log("✅ Partida guardada correctamente");
+        res.json({ success: true });
+    } catch (err) {
+        console.error("Error al guardar partida:", err);
+        res.status(500).json({ error: 'Error al guardar partida' });
     }
-    
-    const gameEntry = { 
-        score: parseInt(score), 
-        song: song, 
-        combo: combo || 0, 
-        player: player || 1, 
-        date: date || new Date().toISOString() 
-    };
-    db.users[username].games.push(gameEntry);
-    
-    const leaderboardEntry = { 
-        name: username, 
-        score: parseInt(score), 
-        song: song, 
-        combo: combo || 0, 
-        date: date || new Date().toISOString() 
-    };
-    db.global_leaderboard.push(leaderboardEntry);
-    
-    db.global_leaderboard.sort((a, b) => b.score - a.score);
-    db.global_leaderboard = db.global_leaderboard.slice(0, 100);
-    
-    saveDB(db);
-    console.log("✅ Partida guardada correctamente");
-    res.json({ success: true });
 });
 
 // ===== 4. OBTENER HISTORIAL DEL USUARIO =====
-app.get('/api/user_games/:username', (req, res) => {
+app.get('/api/user_games/:username', async (req, res) => {
     const { username } = req.params;
     console.log("📋 Solicitando historial de:", username);
     
-    const db = readDB();
-    
-    if (!db.users[username]) {
-        return res.status(404).json({ error: 'Usuario no encontrado' });
+    try {
+        const result = await pool.query(
+            'SELECT score, song, combo, player, played_at FROM games WHERE username = $1 ORDER BY score DESC',
+            [username]
+        );
+        
+        res.json(result.rows);
+    } catch (err) {
+        console.error("Error al obtener historial:", err);
+        res.status(500).json({ error: 'Error al obtener historial' });
     }
-    
-    const games = db.users[username].games;
-    games.sort((a, b) => b.score - a.score);
-    
-    res.json(games);
 });
 
 // ===== 5. OBTENER LEADERBOARD GLOBAL =====
-app.get('/api/global_leaderboard', (req, res) => {
+app.get('/api/global_leaderboard', async (req, res) => {
     console.log("🏆 Solicitando leaderboard global");
-    const db = readDB();
-    res.json(db.global_leaderboard.slice(0, 50));
+    
+    try {
+        const result = await pool.query(
+            `SELECT username as name, score, song, combo, played_at as date 
+             FROM games 
+             ORDER BY score DESC 
+             LIMIT 50`
+        );
+        
+        res.json(result.rows);
+    } catch (err) {
+        console.error("Error al obtener leaderboard:", err);
+        res.status(500).json({ error: 'Error al obtener leaderboard' });
+    }
 });
 
-// ===== 6. OBTENER TOP JUGADORES =====
-app.get('/api/top_players', (req, res) => {
+// ===== 6. OBTENER TOP JUGADORES (por sumatoria de puntos) =====
+app.get('/api/top_players', async (req, res) => {
     console.log("👑 Solicitando top jugadores");
-    const db = readDB();
     
-    const playersStats = [];
-    for (const [name, user] of Object.entries(db.users)) {
-        let totalScore = 0;
-        let gamesCount = user.games.length;
-        let bestScore = 0;
+    try {
+        const result = await pool.query(
+            `SELECT 
+                username as name,
+                SUM(score) as total_score,
+                MAX(score) as best_score,
+                COUNT(*) as games_played
+             FROM games 
+             GROUP BY username 
+             ORDER BY total_score DESC 
+             LIMIT 20`
+        );
         
-        for (const game of user.games) {
-            totalScore += game.score;
-            if (game.score > bestScore) bestScore = game.score;
-        }
-        
-        playersStats.push({
-            name: name,
-            total_score: totalScore,
-            best_score: bestScore,
-            games_played: gamesCount
-        });
+        res.json(result.rows);
+    } catch (err) {
+        console.error("Error al obtener top jugadores:", err);
+        res.status(500).json({ error: 'Error al obtener top jugadores' });
     }
-    
-    playersStats.sort((a, b) => b.total_score - a.total_score);
-    res.json(playersStats.slice(0, 20));
 });
 
-// ===== 7. ENDPOINT PARA VER TODOS LOS USUARIOS =====
-app.get('/api/users', (req, res) => {
+// ===== 7. VER TODOS LOS USUARIOS =====
+app.get('/api/users', async (req, res) => {
     console.log("📋 Solicitando lista de usuarios");
-    const db = readDB();
     
-    const usersList = Object.keys(db.users).map(username => ({
-        username: username,
-        games_played: db.users[username].games.length,
-        created_at: db.users[username].created_at
-    }));
-    
-    res.json(usersList);
-});
-
-// ===== 8. ENDPOINT PARA VER DETALLES DE UN USUARIO =====
-app.get('/api/user/:username', (req, res) => {
-    const { username } = req.params;
-    console.log("🔍 Solicitando detalles de usuario:", username);
-    
-    const db = readDB();
-    
-    if (!db.users[username]) {
-        return res.status(404).json({ error: 'Usuario no encontrado' });
+    try {
+        const result = await pool.query(
+            `SELECT u.username, 
+                    COUNT(g.id) as games_played,
+                    u.created_at
+             FROM users u
+             LEFT JOIN games g ON u.username = g.username
+             GROUP BY u.username
+             ORDER BY u.created_at DESC`
+        );
+        
+        res.json(result.rows);
+    } catch (err) {
+        console.error("Error al obtener usuarios:", err);
+        res.status(500).json({ error: 'Error al obtener usuarios' });
     }
-    
-    res.json({
-        username: username,
-        games: db.users[username].games,
-        total_games: db.users[username].games.length,
-        created_at: db.users[username].created_at
-    });
 });
 
-// ===== 9. ENDPOINT PARA ELIMINAR UN USUARIO =====
-app.delete('/api/user/:username', (req, res) => {
+// ===== 8. ELIMINAR UN USUARIO =====
+app.delete('/api/user/:username', async (req, res) => {
     const { username } = req.params;
     console.log("🗑️ Eliminando usuario:", username);
     
-    const db = readDB();
-    
-    if (!db.users[username]) {
-        return res.status(404).json({ error: 'Usuario no encontrado' });
+    try {
+        const result = await pool.query('DELETE FROM users WHERE username = $1 RETURNING username', [username]);
+        
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Usuario no encontrado' });
+        }
+        
+        console.log("✅ Usuario", username, "eliminado");
+        res.json({ success: true, message: `Usuario ${username} eliminado` });
+    } catch (err) {
+        console.error("Error al eliminar usuario:", err);
+        res.status(500).json({ error: 'Error al eliminar usuario' });
     }
-    
-    // Eliminar sus partidas del leaderboard global
-    db.global_leaderboard = db.global_leaderboard.filter(entry => entry.name !== username);
-    
-    // Eliminar usuario
-    delete db.users[username];
-    
-    saveDB(db);
-    console.log("✅ Usuario", username, "eliminado");
-    res.json({ success: true, message: `Usuario ${username} eliminado` });
 });
 
-// ===== 10. ENDPOINT PARA ELIMINAR TODOS LOS DATOS =====
-app.delete('/api/clear-all', (req, res) => {
+// ===== 9. ELIMINAR TODOS LOS DATOS =====
+app.delete('/api/clear-all', async (req, res) => {
     console.log("🗑️ ELIMINANDO TODOS LOS DATOS");
     
-    const emptyDB = {
-        users: {},
-        global_leaderboard: []
-    };
-    saveDB(emptyDB);
-    
-    console.log("✅ Base de datos completamente limpiada");
-    res.json({ success: true, message: "Todos los datos eliminados" });
-});
-
-// ===== 11. ENDPOINT ANTIGUO PARA COMPATIBILIDAD =====
-app.post('/api/scores', (req, res) => {
-    const { name, score, song, combo, player } = req.body;
-    console.log("⚠️ Endpoint antiguo usado - redirigiendo a save_game");
-    
-    const username = name;
-    const date = new Date().toISOString();
-    
-    const db = readDB();
-    
-    if (!db.users[username]) {
-        db.users[username] = {
-            password: Buffer.from("temporal").toString('base64'),
-            games: [],
-            created_at: date
-        };
+    try {
+        await pool.query('DELETE FROM games');
+        await pool.query('DELETE FROM users');
+        
+        console.log("✅ Base de datos completamente limpiada");
+        res.json({ success: true, message: "Todos los datos eliminados" });
+    } catch (err) {
+        console.error("Error al limpiar DB:", err);
+        res.status(500).json({ error: 'Error al limpiar datos' });
     }
-    
-    const gameEntry = { score: parseInt(score), song, combo: combo || 0, player: player || 1, date };
-    db.users[username].games.push(gameEntry);
-    
-    const leaderboardEntry = { name: username, score: parseInt(score), song, combo: combo || 0, date };
-    db.global_leaderboard.push(leaderboardEntry);
-    db.global_leaderboard.sort((a, b) => b.score - a.score);
-    db.global_leaderboard = db.global_leaderboard.slice(0, 100);
-    
-    saveDB(db);
-    res.json({ success: true });
 });
 
-// ===== 12. ENDPOINT ANTIGUO /global =====
-app.get('/api/global', (req, res) => {
+// ===== 10. ENDPOINT ANTIGUO PARA COMPATIBILIDAD =====
+app.get('/api/global', async (req, res) => {
     console.log("⚠️ Endpoint antiguo /global usado");
-    const db = readDB();
-    res.json(db.global_leaderboard.slice(0, 20));
+    
+    try {
+        const result = await pool.query(
+            'SELECT username as name, score, song, combo FROM games ORDER BY score DESC LIMIT 20'
+        );
+        res.json(result.rows);
+    } catch (err) {
+        res.json([]);
+    }
 });
 
-// ===== 13. LIMPIAR BASE DE DATOS (endpoint original) =====
-app.delete('/api/clear', (req, res) => {
-    const emptyDB = {
-        users: {},
-        global_leaderboard: []
-    };
-    saveDB(emptyDB);
-    console.log("🗑️ Base de datos limpiada");
-    res.json({ success: true, message: "Datos eliminados" });
+// ===== 11. ELIMINAR PARTIDA ESPECÍFICA (opcional) =====
+app.delete('/api/game/:id', async (req, res) => {
+    const { id } = req.params;
+    
+    try {
+        await pool.query('DELETE FROM games WHERE id = $1', [id]);
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: 'Error al eliminar partida' });
+    }
 });
 
 // ===== INICIAR SERVIDOR =====
-app.listen(PORT, () => {
-    console.log(`🎵 API de Rhythm Game corriendo en http://localhost:${PORT}`);
-    console.log(`📋 Endpoints disponibles:`);
-    console.log(`   POST /api/register - Registro de usuario`);
-    console.log(`   POST /api/login - Inicio de sesión`);
-    console.log(`   POST /api/save_game - Guardar partida`);
-    console.log(`   GET /api/user_games/:username - Historial del usuario`);
-    console.log(`   GET /api/global_leaderboard - Leaderboard global`);
-    console.log(`   GET /api/users - VER TODOS los usuarios`);
-    console.log(`   GET /api/user/:username - Ver detalles de usuario`);
-    console.log(`   DELETE /api/user/:username - Eliminar usuario`);
-    console.log(`   DELETE /api/clear-all - ELIMINAR TODOS los datos`);
+initDB().then(() => {
+    app.listen(PORT, () => {
+        console.log(`🎵 API de Rhythm Game corriendo en http://localhost:${PORT}`);
+        console.log(`📋 Base de datos: PostgreSQL en Render`);
+        console.log(`📋 Endpoints disponibles:`);
+        console.log(`   POST /api/register - Registro de usuario`);
+        console.log(`   POST /api/login - Inicio de sesión`);
+        console.log(`   POST /api/save_game - Guardar partida`);
+        console.log(`   GET /api/user_games/:username - Historial del usuario`);
+        console.log(`   GET /api/global_leaderboard - Leaderboard global`);
+        console.log(`   GET /api/users - Ver todos los usuarios`);
+        console.log(`   DELETE /api/user/:username - Eliminar usuario`);
+        console.log(`   DELETE /api/clear-all - Eliminar todos los datos`);
+    });
 });
