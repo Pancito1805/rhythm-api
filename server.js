@@ -35,6 +35,32 @@ function saveDB(db) {
     fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
 }
 
+// ==================== PING PARA CRON JOB ====================
+app.get('/api/ping', (req, res) => {
+    const now = new Date();
+    console.log(`[PING] ${now.toISOString()} - Servidor activo`);
+    res.json({ 
+        status: 'ok', 
+        message: 'Server is running',
+        timestamp: now.toISOString(),
+        uptime: process.uptime()
+    });
+});
+
+// ==================== HEALTH CHECK ====================
+app.get('/api/health', (req, res) => {
+    const db = readDB();
+    const stats = {
+        status: 'healthy',
+        timestamp: new Date().toISOString(),
+        uptime: process.uptime(),
+        users_count: Object.keys(db.users).length,
+        leaderboard_count: db.global_leaderboard.length,
+        game_history_count: db.game_history.length
+    };
+    res.json(stats);
+});
+
 // ==================== 1. REGISTRO DE USUARIO ====================
 app.post('/api/register', (req, res) => {
     const { username, password } = req.body;
@@ -107,11 +133,12 @@ app.post('/api/login', (req, res) => {
     res.json({ success: true, username: username });
 });
 
-// ==================== 3. GUARDAR PARTIDA COMPLETA ====================
+// ==================== 3. GUARDAR PARTIDA COMPLETA (MODIFICADO) ====================
 app.post('/api/save_game_complete', (req, res) => {
     const { username, song, combo, victory, time, difficulty, perfect, great, good, ok, miss, boss_hp_remaining, player_hp_remaining, date } = req.body;
     
     console.log("Guardando partida completa para:", username);
+    console.log("  Datos:", { combo, victory, time, difficulty, perfect, great, good, ok, miss });
     
     const db = readDB();
     
@@ -178,18 +205,30 @@ app.post('/api/save_game_complete', (req, res) => {
     db.game_history.sort((a, b) => new Date(b.date) - new Date(a.date));
     db.game_history = db.game_history.slice(0, 200);
     
-    // Actualizar leaderboard global (por combo)
-    const leaderboardEntry = {
-        name: username,
-        combo: combo,
-        song: song,
-        difficulty: difficulty,
-        victory: victory,
-        date: date || new Date().toISOString()
-    };
-    db.global_leaderboard.push(leaderboardEntry);
-    db.global_leaderboard.sort((a, b) => b.combo - a.combo);
-    db.global_leaderboard = db.global_leaderboard.slice(0, 100);
+    // Actualizar leaderboard global con TODOS los campos (solo victorias)
+    if (victory) {
+        const leaderboardEntry = {
+            name: username,
+            combo: combo || 0,
+            time: time || 0,
+            difficulty: difficulty || "MEDIO",
+            perfect: perfect || 0,
+            great: great || 0,
+            good: good || 0,
+            ok: ok || 0,
+            miss: miss || 0,
+            victory: true,
+            date: date || new Date().toISOString()
+        };
+        db.global_leaderboard.push(leaderboardEntry);
+        
+        // Ordenar por tiempo (menor es mejor)
+        db.global_leaderboard.sort((a, b) => {
+            if (a.time !== b.time) return a.time - b.time;
+            return b.combo - a.combo;
+        });
+        db.global_leaderboard = db.global_leaderboard.slice(0, 100);
+    }
     
     saveDB(db);
     console.log("Partida guardada para:", username);
@@ -306,11 +345,12 @@ app.get('/api/user/:username', (req, res) => {
     });
 });
 
-// ==================== 9. LEADERBOARD GLOBAL ====================
+// ==================== 9. LEADERBOARD GLOBAL (MODIFICADO) ====================
 app.get('/api/global_leaderboard', (req, res) => {
     console.log("Obteniendo leaderboard global");
     const db = readDB();
-    res.json(db.global_leaderboard.slice(0, 50));
+    // Devolver todos los campos
+    res.json(db.global_leaderboard);
 });
 
 // ==================== 10. LEADERBOARD POR CANCION ====================
@@ -321,7 +361,10 @@ app.get('/api/song_leaderboard/:song', (req, res) => {
     const db = readDB();
     const songLeaderboard = db.game_history
         .filter(game => game.song === song && game.victory === true)
-        .sort((a, b) => b.combo - a.combo)
+        .sort((a, b) => {
+            if (a.time !== b.time) return a.time - b.time;
+            return b.combo - a.combo;
+        })
         .slice(0, 50);
     
     res.json(songLeaderboard);
@@ -357,7 +400,7 @@ app.get('/api/top_players', (req, res) => {
 app.get('/api/global', (req, res) => {
     console.log("Endpoint global legacy usado");
     const db = readDB();
-    res.json(db.global_leaderboard.slice(0, 20));
+    res.json(db.global_leaderboard);
 });
 
 // ==================== 13. ENDPOINT SCORES (LEGACY) ====================
@@ -474,6 +517,9 @@ app.listen(PORT, () => {
     console.log("  GET /api/global_leaderboard - Leaderboard global");
     console.log("  GET /api/song_leaderboard/:song - Leaderboard por cancion");
     console.log("  GET /api/top_players - Top jugadores");
+    console.log("\nCRON / MONITOREO:");
+    console.log("  GET /api/ping - Ping para cron job");
+    console.log("  GET /api/health - Health check con estadisticas");
     console.log("\nADMIN:");
     console.log("  DELETE /api/clear-all - Eliminar todos los datos");
     console.log("  DELETE /api/clear - Eliminar datos (legacy)");
